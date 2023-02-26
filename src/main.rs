@@ -1,32 +1,32 @@
-#![feature(is_sorted)]
 #![feature(path_file_prefix)]
 #![feature(buf_read_has_data_left)]
 #![feature(file_create_new)]
 
+use std::{
+    env,
+    fs::{File},
+    io::{self, BufRead, Read, Write},
+    hash::Hash,
+    path::{Path, PathBuf}
+};
+
 mod decode;
 mod encode;
 
-use std::{env, fs, io};
-use std::fmt::format;
-use std::fs::File;
-use std::hash::Hash;
-use std::io::{BufRead, Read, Write};
-use std::path::Path;
-use uuid::Uuid;
-use md5;
-use std::path::PathBuf;
-use std::ptr::hash;
-
+#[derive(Debug)]
 pub struct FilePart {
     pub part_file: File,
     pub hash_bytes: Vec<u8>,
     pub part_file_name: String,
 }
 
+#[derive(Debug)]
 pub struct CompositeFile {
     pub filename: String,
     pub file_extension: String,
-    pub parts: Vec<FilePart>
+    pub file_len: usize,
+    pub parts: Vec<FilePart>,
+    pub uuid_parts: String,
 }
 
 #[derive(Debug)]
@@ -36,16 +36,11 @@ struct Config {
     options: Options
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Default, Clone)]
 pub struct Options {
     count_parts: Option<u8>,
     size_parts: Option<usize>
-}
-
-#[derive(Debug)]
-enum OptionArg {
-    CountParts(u8),
-    SizeParts(usize)
 }
 
 impl Config {
@@ -117,28 +112,25 @@ impl Default for Config {
     }
 }
 
-///
-/// Format packet:
-/// |-----------|--------------|
-/// |---hash----|-----data-----|
-/// |--[u8;16]--|-----[u8]-----|
-/// |-----------|--------------|
-///
-/// Format MetaFile:
-/// |----------------------|------------------|--------------|------------------|
-/// |--file_extension_len--|--file_extension--|--count_hash--|----hash_parts----|
-/// |-------usize----------|-------[u8]-------|-----usize----|--Array<[u8;16]>--|
-/// |----------------------|------------------|--------------|------------------|
-///
+//*
+//* Format packet:
+//* |---hash----|-----data-----|
+//* |--[u8;16]--|-----[u8]-----|
+//*
+//* Format MetaFile:
+//* |--file_extension_len--|--file_extension--|--count_hash--|----hash_parts----|
+//* |-------usize----------|-------[u8]-------|-----usize----|--Array<[u8;16]>--|
+//*
 
 fn main() -> io::Result<()> {
 
     let config = Config::new_from_env_args();
 
-
     match config.method {
-       'd' => decode::decode_file(&config.path),
-       'e' => encode::encode_file(&config.path, config.options.size_parts),
+       'd' => decode::decode_file(&config.path).unwrap(),
+       'e' => encode::encode_file(&config.path, config.options.size_parts).unwrap(),
        _ => panic!("Неподерживаемый аргумент")
     }
+
+    Ok(())
 }
