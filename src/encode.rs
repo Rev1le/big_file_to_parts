@@ -1,48 +1,81 @@
-use std::{fs, io};
-use std::fs::File;
-use std::io::{BufRead, Write};
-use std::path::PathBuf;
+use std::{fs::{self, File}, io::{self, BufRead, Write, BufReader},path::PathBuf};
+use std::ffi::OsString;
+use std::io::Error;
+use std::process::ExitCode;
 use uuid::Uuid;
+
 use super::FilePart;
 use super::CompositeFile;
 
+#[derive(Debug)]
+pub enum EncodeErrors {
+    IOError(::std::io::Error),
+    OsStringError(std::ffi::OsString),
+    PathParseError,
+}
 
-pub fn encode_file(path: &PathBuf, size_part_opt: Option<usize>) -> io::Result<()> {
+impl From<std::io::Error> for EncodeErrors {
+    fn from(value: std::io::Error) -> Self {
+        EncodeErrors::IOError(value)
+    }
+}
 
-    let size_part = if let Some(size_parts) = size_part_opt {
-        size_parts
-    } else {
-        1_073_741_824
-    };
+impl From<std::ffi::OsString> for EncodeErrors {
+    fn from(value: std::ffi::OsString) -> Self {
+        EncodeErrors::OsStringError(value)
+    }
+}
 
-    let f = File::open(dbg!(&path))?;
-    let mut f  = io::BufReader::with_capacity(size_part, f);
+pub fn encode_file(path: &PathBuf, size_part_opt: Option<usize>) -> Result<(), EncodeErrors> {
 
-    let mut com_file = CompositeFile {
-        filename: path.file_prefix().unwrap().to_os_string().into_string().unwrap(),
-        file_extension:  path.extension().unwrap().to_os_string().into_string().unwrap(),
+    if !path.is_file() {
+        panic!("Предоставьте путь к файлу сборки")
+    }
+
+    let mut size_part = size_part_opt.unwrap_or(1_073_741_824_usize);
+    let mut f  = BufReader::with_capacity(
+        size_part,
+        File::open(&path)?
+    );
+
+    let mut com_file = dbg!(CompositeFile {
+        filename: path
+            .file_stem()
+            .ok_or(EncodeErrors::PathParseError)?
+            .to_os_string()
+            .into_string()?,
+        file_extension:  path
+            .extension()
+            .ok_or(EncodeErrors::PathParseError)?
+            .to_os_string()
+            .into_string()?,
+        file_len: f.capacity(),
         parts: vec![],
-    };
+        uuid_parts: Uuid::new_v4().to_string(),
+    });
 
     let mut number_part = 1;
-    while f.has_data_left().unwrap() {
+
+    while f.has_data_left()? {
+
         let buffer_bytes = f.fill_buf()?;
         let buffer_bytes_len = buffer_bytes.len();
-        let part = encode_part(number_part, buffer_bytes)?;
+
+        let part = encode_part(&com_file.uuid_parts, number_part, buffer_bytes)?;
         com_file.parts.push(part);
 
         number_part += 1;
         f.consume(buffer_bytes_len);
     }
 
-    encode_metafile(&com_file);
+    encode_metafile(&com_file)?;
 
     Ok(())
 }
 
-fn encode_part(part_number: u8, data: &[u8]) -> io::Result<FilePart> {
+fn encode_part(part_uuid: &str, part_number: u8, data: &[u8]) -> io::Result<FilePart> {
 
-    let part_uuid = Uuid::new_v4();
+    //let part_uuid = Uuid::new_v4();
     let part_file_name = format!("{}_{}.part", part_uuid, part_number);
     let hash_bytes = md5::compute(&part_file_name).0.to_vec();
 
@@ -52,7 +85,7 @@ fn encode_part(part_number: u8, data: &[u8]) -> io::Result<FilePart> {
         .copied()
         .collect::<Vec<u8>>();
 
-    let mut part_file = File::create_new(&part_file_name)?;
+    let mut part_file = fs::File::create_new(&part_file_name)?;
     part_file.write(&part_bytes)?;
 
     println!("Файл с частью данными был создан => {}", &part_file_name);
@@ -65,14 +98,31 @@ fn encode_part(part_number: u8, data: &[u8]) -> io::Result<FilePart> {
 }
 
 fn encode_metafile(composite_file: &CompositeFile) -> io::Result<()> {
-    let mut f = fs::File::create(format!("build_file_{}.meta", composite_file.filename))?;
-    let file_format_bytes =  composite_file.file_extension.as_bytes();
+    let mut f = File::create(format!("build_file_{}.meta", composite_file.filename))?;
+    let source_filename_bytes = composite_file.filename.as_bytes();
+    let source_format_bytes =  composite_file.file_extension.as_bytes();
+    let parts_uuid_bytes = composite_file.uuid_parts.as_bytes();
 
-    f.write(&file_format_bytes.len().to_be_bytes())?;
-    f.write(file_format_bytes)?;
+    // Запись имени исходного файла
+    f.write(&(source_filename_bytes.len() as u8).to_be_bytes())?;
+    f.write(source_filename_bytes)?;
+
+    // Запись расширения исходного файла
+    f.write(&(source_format_bytes.len() as u8).to_be_bytes())?;
+    f.write(source_format_bytes)?;
+
+    // Запись uuid в названии частей.
+    f.write(&(parts_uuid_bytes.len() as u8).to_be_bytes())?;
+    f.write(parts_uuid_bytes)?;
+
+    // Запись всех хешей частей как массив
     f.write(&composite_file.parts.len().to_be_bytes())?;
-    composite_file.parts.iter().map(|x| f.write(&x.hash_bytes).unwrap()).collect::<Vec<_>>();
+    composite_file.parts
+        .iter()
+        .map(
+            |x| f.write(&x.hash_bytes).unwrap()
+        )
+        .for_each(drop);
 
     Ok(())
-
 }
