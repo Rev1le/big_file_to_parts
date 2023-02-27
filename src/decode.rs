@@ -1,13 +1,36 @@
-use std::{fs, io, path};
-use std::borrow::Cow;
-use std::fs::File;
-use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::{
+    fs::{self, File},
+    io::{self, Read, Write, BufReader, Error},
+    path::{self, PathBuf},
+    borrow::Cow
+};
+use std::string::FromUtf8Error;
+
 use crate::{CompositeFile, FilePart};
 
 struct MetaFile {
 
 }
+
+#[derive(Debug)]
+pub enum DecodeErrors {
+    IOError(::std::io::Error),
+    FromUtf8Error(::std::string::FromUtf8Error),
+    IterationError,
+}
+
+impl From<std::io::Error> for DecodeErrors {
+    fn from(value: Error) -> Self {
+        DecodeErrors::IOError(value)
+    }
+}
+
+impl From<std::string::FromUtf8Error> for DecodeErrors {
+    fn from(value: FromUtf8Error) -> Self {
+        DecodeErrors::FromUtf8Error(value)
+    }
+}
+
 
 #[derive(Debug)]
 struct HashPart([u8;16]);
@@ -20,66 +43,67 @@ impl HashPart {
     }
 }
 
-pub fn decode_file(path: &PathBuf) -> io::Result<()> {
+pub trait DecodeType: Sized {
+    fn decode_from_iter(iter: &mut impl Iterator<Item=u8>) -> Result<Self, DecodeErrors>;
+}
 
+impl DecodeType for u8 {
+    fn decode_from_iter(iter: &mut impl Iterator<Item=u8>) -> Result<Self, DecodeErrors> {
+        iter.next().ok_or(DecodeErrors::IterationError)
+    }
+}
+
+impl DecodeType for usize {
+    fn decode_from_iter(iter: &mut impl Iterator<Item=u8>) -> Result<Self, DecodeErrors> {
+        let mut buffer_bytes = [0_u8;8];
+        for i in 0..std::mem::size_of::<Self>() {
+            buffer_bytes[i] = (iter.next().ok_or(DecodeErrors::IterationError)?);
+        }
+        Ok(<usize>::from_be_bytes(buffer_bytes))
+    }
+}
+
+fn decode_str<T: DecodeType + Into<usize>>(iter: &mut impl Iterator<Item=u8>) -> Result<String, DecodeErrors> {
+    let len_str = T::decode_from_iter(iter)?.into();
+
+    let mut output_str_bytes = Vec::with_capacity(len_str);
+
+    for _ in 0..len_str {
+        output_str_bytes.push(iter.next().ok_or(DecodeErrors::IterationError)?);
+    }
+
+    Ok(String::from_utf8(output_str_bytes)?)
+}
+
+pub fn decode_file(path: &PathBuf) -> Result<(), DecodeErrors> {
 
     if !path.is_file() {
         panic!("Предоставьте путь к файлу сборки")
     }
 
-    let mut dir = dbg!(path.parent().unwrap().to_path_buf());
-    dir.push("");
-    let mut f = fs::File::open(&path)?;
+    let mut parts_folder = path.clone();
+    parts_folder.pop();
 
-    let filename =  dbg!(
-            path
-                .file_prefix()
-                .unwrap()
-                .to_string_lossy()
-                .parse::<String>()
-                .unwrap()
-                .split('_')
-                .last()
-                .unwrap()
-                .to_owned()
-    );
-    //let b = filename.split('_').last().unwrap();
-    let file_extension = dbg!(decode_input_file_extension(&mut f));
+    let mut metafile_bytes = vec![];
+    File::open(&path)?.read_to_end(&mut metafile_bytes)?;
 
-    let mut count_parts_bytes = [0;8];
-    f.read(&mut count_parts_bytes)?;
+    let mut metafile_bytes_iter = metafile_bytes.into_iter();
 
-    let count_parts = <usize>::from_be_bytes(count_parts_bytes);
+    let source_filename_bytes = dbg!(decode_str::<u8>(&mut metafile_bytes_iter)?);
+    let source_format = dbg!(decode_str::<u8>(&mut metafile_bytes_iter)?);
+    let parts_uuid = dbg!(decode_str::<u8>(&mut metafile_bytes_iter)?);
 
-    let mut parts_hash = vec![];
-    for _ in 0..count_parts {
-        parts_hash.push(HashPart::read(&mut f));
-    }
+    let count_parts = dbg!(<usize>::decode_from_iter(&mut metafile_bytes_iter)?);
 
-    //println!("{:?}", parts_hash);
+    let mut output_f = File::create(format!("{}.{}", source_filename_bytes, source_format))?;
 
-    let mut output_file = File::create(format!("{}.{}", filename, file_extension)).unwrap();
-
-    let mut tmp_has = [0_u8; 16];
-
-
-    for part_hash in parts_hash {
-        let mut dir_entres = dir.read_dir().unwrap();
-
-        dir_entres.find(|entry| {
-            if let Ok(mut f_part) = fs::File::open(dbg!(entry.as_ref().unwrap().path())) {
-                f_part.read(&mut tmp_has).unwrap();
-
-                if part_hash.0 == tmp_has {
-                    let mut part_data = vec![];
-                    f_part.read_to_end(&mut part_data).unwrap();
-                    output_file.write(&part_data).unwrap();
-                    return true
-
-                }
-            }
-            return false
-        });
+    let parts_hashes = metafile_bytes_iter.collect::<Vec<u8>>();
+    for i in 0..count_parts {
+        let part_hash = dbg!(&parts_hashes[0+16*i..16+16*i]);
+        let mut part = decode_part(&parts_uuid,i+1, part_hash);
+        let mut bytes_part = Vec::with_capacity(100_000);
+        part.part_file.read_to_end(&mut bytes_part)?;
+        output_f.write(&bytes_part)?;
     }
 
     Ok(())
@@ -95,7 +119,7 @@ fn decode_input_file_extension(src: &mut impl Read) -> String {
         extension_bytes.set_len(extension_len);
     }
 
-    src.read( &mut extension_bytes).unwrap();
+    src.read(&mut extension_bytes).unwrap();
 
     String::from_utf8(extension_bytes).unwrap()
 }
@@ -106,10 +130,27 @@ fn decode_metafile() -> MetaFile {
     }
 }
 
-fn decode_part() -> FilePart {
+fn decode_part(part_uuid: &str, part_number: usize, part_hash: &[u8]) -> FilePart {
+
+    let part_filename = dbg!(format!("{}_{}.part", part_uuid, part_number));
+
+    let mut f = File::open(&part_filename).unwrap();
+    let mut tmp_hash = [0_u8;16];
+    f.read(&mut tmp_hash).unwrap();
+
+    let v = tmp_hash
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, byte)| if byte == part_hash[index] {Some(byte)} else {None} )
+        .collect::<Vec<_>>();
+
+    if v.len() != 16 {
+        panic!("Хеш файла не совпадает")
+    }
+
     FilePart {
-        part_file: fs::File::create("/").unwrap(),
-        hash_bytes: vec![],
-        part_file_name: "".to_string(),
+        part_file: f,
+        hash_bytes: v,
+        part_file_name: part_filename,
     }
 }

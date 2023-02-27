@@ -29,7 +29,7 @@ impl From<std::ffi::OsString> for EncodeErrors {
 pub fn encode_file(path: &PathBuf, size_part_opt: Option<usize>) -> Result<(), EncodeErrors> {
 
     if !path.is_file() {
-        panic!("Предоставьте путь к файлу сборки")
+        panic!("Предоставьте путь к файлу")
     }
 
     let mut size_part = size_part_opt.unwrap_or(1_073_741_824_usize);
