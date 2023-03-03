@@ -17,6 +17,7 @@ pub enum DecodeErrors {
     IOError(::std::io::Error),
     FromUtf8Error(::std::string::FromUtf8Error),
     IterationError,
+    DecodePart(usize),
 }
 
 impl From<std::io::Error> for DecodeErrors {
@@ -37,8 +38,10 @@ struct HashPart([u8;16]);
 
 impl HashPart {
     fn read(src: &mut impl Read) -> Self {
+
         let mut bytes = [0_u8;16];
         src.read(&mut bytes).unwrap();
+
         HashPart(bytes)
     }
 }
@@ -57,7 +60,7 @@ impl DecodeType for usize {
     fn decode_from_iter(iter: &mut impl Iterator<Item=u8>) -> Result<Self, DecodeErrors> {
         let mut buffer_bytes = [0_u8;8];
         for i in 0..std::mem::size_of::<Self>() {
-            buffer_bytes[i] = (iter.next().ok_or(DecodeErrors::IterationError)?);
+            buffer_bytes[i] = iter.next().ok_or(DecodeErrors::IterationError)?;
         }
         Ok(<usize>::from_be_bytes(buffer_bytes))
     }
@@ -69,7 +72,9 @@ fn decode_str<T: DecodeType + Into<usize>>(iter: &mut impl Iterator<Item=u8>) ->
     let mut output_str_bytes = Vec::with_capacity(len_str);
 
     for _ in 0..len_str {
-        output_str_bytes.push(iter.next().ok_or(DecodeErrors::IterationError)?);
+        output_str_bytes.push(
+            iter.next().ok_or(DecodeErrors::IterationError)?
+        );
     }
 
     Ok(String::from_utf8(output_str_bytes)?)
@@ -78,7 +83,10 @@ fn decode_str<T: DecodeType + Into<usize>>(iter: &mut impl Iterator<Item=u8>) ->
 pub fn decode_file(path: &PathBuf) -> Result<(), DecodeErrors> {
 
     if !path.is_file() {
-        panic!("Предоставьте путь к файлу сборки")
+        println!(
+            "\n!!!!!!!!!!!!!\nПредоставьте путь к файлу сборки\n!!!!!!!!!!!!!\n"
+        );
+        std::process::exit(2)
     }
 
     let mut parts_folder = path.clone();
@@ -89,22 +97,53 @@ pub fn decode_file(path: &PathBuf) -> Result<(), DecodeErrors> {
 
     let mut metafile_bytes_iter = metafile_bytes.into_iter();
 
-    let source_filename_bytes = dbg!(decode_str::<u8>(&mut metafile_bytes_iter)?);
-    let source_format = dbg!(decode_str::<u8>(&mut metafile_bytes_iter)?);
-    let parts_uuid = dbg!(decode_str::<u8>(&mut metafile_bytes_iter)?);
+    let source_filename = decode_str::<u8>(&mut metafile_bytes_iter)?;
+    let source_format = decode_str::<u8>(&mut metafile_bytes_iter)?;
+    let parts_uuid = decode_str::<u8>(&mut metafile_bytes_iter)?;
 
-    let count_parts = dbg!(<usize>::decode_from_iter(&mut metafile_bytes_iter)?);
+    let mut output_file = File::create(
+        format!("{}.{}", source_filename, source_format)
+    )?;
 
-    let mut output_f = File::create(format!("{}.{}", source_filename_bytes, source_format))?;
-
+    // Остаточные байты представляют из себя массив хешей,
+    // где кол-во хешей берется из контекста
+    let count_parts = <usize>::decode_from_iter(&mut metafile_bytes_iter)?;
     let parts_hashes = metafile_bytes_iter.collect::<Vec<u8>>();
-    for i in 0..count_parts {
-        let part_hash = dbg!(&parts_hashes[0+16*i..16+16*i]);
-        let mut part = decode_part(&parts_uuid,i+1, part_hash);
-        let mut bytes_part = Vec::with_capacity(100_000);
-        part.part_file.read_to_end(&mut bytes_part)?;
-        output_f.write(&bytes_part)?;
+
+    if count_parts != parts_hashes.len()/16 {
+        println!(
+            "\n!!!!!!!!!!!!!\nОшибка кол-ва частей в сборочном файле.\n!!!!!!!!!!!!!\n"
+        );
+        std::process::exit(2)
     }
+
+    parts_hashes
+        .chunks(16)
+        .enumerate()
+        .map(|(part_ind, part_hash)| {
+            let mut part = decode_part(
+                &parts_uuid,
+                part_ind+1,
+                part_hash
+            );
+
+            let mut bytes_part = vec![];
+            part.part_file.read_to_end(&mut bytes_part)?;
+
+            output_file.write(&bytes_part)?;
+            Ok::<(), DecodeErrors>(())
+        })
+        .all(|res|
+            if res.is_ok() {
+                true
+            } else {
+                println!(
+                    "\n!!!!!!!!!!!!!\nНекорректное декодирование части с ошибкой {:?}\n!!!!!!!!!!!!!\n",
+                    res.err().unwrap()
+                );
+                std::process::exit(2)
+            }
+        );
 
     Ok(())
 }
@@ -132,25 +171,39 @@ fn decode_metafile() -> MetaFile {
 
 fn decode_part(part_uuid: &str, part_number: usize, part_hash: &[u8]) -> FilePart {
 
-    let part_filename = dbg!(format!("{}_{}.part", part_uuid, part_number));
+    let part_file_name = format!("{}_{}.part", part_uuid, part_number);
 
-    let mut f = File::open(&part_filename).unwrap();
+    let mut part_file = if let Ok(f) = File::open(&part_file_name){
+        f
+    } else {
+        println!(
+            "\n!!!!!!!!!!!!!\nНеудается найти {} часть в текущей папке.\n!!!!!!!!!!!!!\n",
+            part_number
+        );
+        std::process::exit(2)
+    };
+
     let mut tmp_hash = [0_u8;16];
-    f.read(&mut tmp_hash).unwrap();
+    part_file.read(&mut tmp_hash).unwrap();
 
-    let v = tmp_hash
+    let hash_bytes = tmp_hash
         .into_iter()
         .enumerate()
+        // Сравнение хеша, полученного из сброчного файла и хеша в файле
         .filter_map(|(index, byte)| if byte == part_hash[index] {Some(byte)} else {None} )
         .collect::<Vec<_>>();
 
-    if v.len() != 16 {
-        panic!("Хеш файла не совпадает")
+    if hash_bytes.len() != 16 {
+        println!(
+            "\n!!!!!!!!!!!!!\nХеш {} части не совпадает.\n!!!!!!!!!!!!!\n",
+            part_number
+        );
+        std::process::exit(2)
     }
 
     FilePart {
-        part_file: f,
-        hash_bytes: v,
-        part_file_name: part_filename,
+        part_file,
+        hash_bytes,
+        part_file_name,
     }
 }

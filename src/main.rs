@@ -128,7 +128,7 @@ fn main() -> io::Result<()> {
 
     match config.method {
        'd' => decode::decode_file(&config.path).unwrap(),
-       'e' => encode::encode_file(&config.path, config.options.size_parts).unwrap(),
+       'e' => encode::encode_file(&config.path, Some(500_000)).unwrap(),//config.options.size_parts).unwrap(),
        _ => panic!("Неподерживаемый аргумент")
     }
 
